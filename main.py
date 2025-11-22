@@ -39,6 +39,8 @@ class PaymentStatusResponse(BaseModel):
     status: Literal["PENDING", "PAID", "CANCELLED"]
     created_at: datetime
     qr_base64: Optional[str] = None  # QR เป็น base64
+    user_id: Optional[str] = None
+    discount_mode: Optional[str] = None
 
 
 class NotificationResponse(BaseModel):
@@ -53,12 +55,27 @@ class PaymentCreateRequest(BaseModel):
     amount: float = Field(
         ...,
         gt=0,
-        description="Base amount before discount (THB). System will apply 0–1% discount and unique final amount."
+        description="Base amount before discount (THB). System will apply discount depending on mode."
     )
     description: Optional[str] = Field(None, max_length=200)
     prompay_id: Optional[str] = Field(
         None,
         description="PromptPay ID / phone (Thai). If omitted, use default merchant PromptPay ID."
+    )
+    user_id: Optional[str] = Field(
+        None,
+        description="User identifier used to keep discount stable within a short window."
+    )
+    discount: Optional[str] = Field(
+        None,
+        description=(
+            "Discount mode: "
+            "'none' = queue incremental discount 0.00,0.01,0.02,... (per base_amount+prompay_id, 5 min window); "
+            "'auto' = random 0–2%; "
+            "'<x>percen' e.g. '0.05percen' => random 0–5%; "
+            "'<x>bath' e.g. '2.2bath' => random 0–2.2 THB. "
+            "If omitted, behaves like 'auto'."
+        )
     )
 
 
@@ -77,6 +94,13 @@ payments_db: Dict[UUID, dict] = {}  # payment_id -> payment data
 # เก็บยอดที่จ่ายจริง (pay_amount) ที่ถูกใช้ล่าสุด
 RECENT_AMOUNT_WINDOW = timedelta(minutes=10)
 recent_pay_amounts: Dict[float, datetime] = {}  # pay_amount -> last_used_time
+
+# เก็บ discount เดิมของ user_id + base_amount ภายใน 10 นาที (สำหรับโหมดที่สุ่ม)
+USER_DISCOUNT_WINDOW = timedelta(minutes=10)
+user_recent_discounts: Dict[Tuple[str, float], dict] = {}  # (user_id, base_amount) -> {discount, pay_amount, mode, used_at}
+
+# NONE-mode queue window
+NONE_MODE_QUEUE_WINDOW = timedelta(minutes=5)
 
 
 # ------------------------------------------------------------------------------
@@ -215,7 +239,7 @@ async def notify_notification_prompay(
 
 
 # ------------------------------------------------------------------------------
-# HELPER: UNIQUE pay_amount (หลังหักส่วนลด)
+# HELPER: CLEANERS
 # ------------------------------------------------------------------------------
 
 def clean_old_pay_amounts() -> None:
@@ -228,51 +252,216 @@ def clean_old_pay_amounts() -> None:
         del recent_pay_amounts[a]
 
 
-def pick_discount_for_base_amount(base_amount: float) -> Tuple[float, int, float]:
+def clean_old_user_discounts() -> None:
+    now = datetime.utcnow()
+    to_delete = []
+    for key, data in list(user_recent_discounts.items()):
+        if now - data["used_at"] > USER_DISCOUNT_WINDOW:
+            to_delete.append(key)
+    for k in to_delete:
+        del user_recent_discounts[k]
+
+
+def compute_unique_suffix(base_amount: float, discount: float) -> int:
+    """
+    แปลง discount (บาท) เป็น unique_suffix (สตางค์) 0–99 (แค่ให้ client แสดง)
+    ถ้าเกิน 0.99 บาทจะถูก clamp เป็น 99
+    """
+    satang = int(round(discount * 100))
+    if satang < 0:
+        satang = 0
+    if satang > 99:
+        satang = 99
+    return satang
+
+
+def resolve_discount_mode(raw_mode: Optional[str]) -> str:
+    if raw_mode is None or raw_mode.strip() == "":
+        return "auto"
+    m = raw_mode.strip().lower()
+    if m in ("none", "auto"):
+        return m
+    if m.endswith("percen") or m.endswith("bath"):
+        return m
+    # ค่าอื่นๆ ที่ไม่รู้จัก treat เป็น auto
+    return "auto"
+
+
+# ------------------------------------------------------------------------------
+# HELPER: DISCOUNT CALCULATION (non-none modes)
+# ------------------------------------------------------------------------------
+
+def pick_discount_for_base_amount(
+    base_amount: float,
+    discount_mode: str,
+    user_id: Optional[str] = None,
+) -> Tuple[float, int, float]:
+    """
+    คืนค่า: (discount_thb, unique_suffix, pay_amount)
+    - discount_mode:
+        auto   : สุ่ม 0–2% ของ base_amount
+        Xpercen: เช่น 0.05percen => 0–5%
+        Xbath  : เช่น 2.2bath   => 0–2.2 บาท
+    - ถ้ามี user_id เดิมที่เรียกด้วย base_amount เดิมใน 10 นาทีที่ผ่านมา
+      จะ reuse discount เดิม (กันกดวนเพื่อลุ้นส่วนลด)
+    - ยอดจ่ายสุดท้ายต้อง >= 1 บาท
+    """
     base_amount = round(base_amount, 2)
+    if base_amount < 1.0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Base amount must be at least 1 THB because final pay_amount must be >= 1 THB."
+        )
+
+    discount_mode = resolve_discount_mode(discount_mode)
+    if discount_mode == "none":
+        # โหมด none ไม่ควรเข้าฟังก์ชันนี้ ให้ไปใช้ compute_none_mode_discount แทน
+        raise RuntimeError("pick_discount_for_base_amount should not be called with discount_mode='none'")
+
     clean_old_pay_amounts()
+    clean_old_user_discounts()
     now = datetime.utcnow()
 
-    if base_amount < 1:
+    # ถ้ามี user_id และมี cache เดิมให้ใช้ซ้ำ
+    if user_id is not None:
+        key = (user_id, base_amount)
+        cached = user_recent_discounts.get(key)
+        if cached and now - cached["used_at"] <= USER_DISCOUNT_WINDOW:
+            discount = cached["discount"]
+            pay_amount = cached["pay_amount"]
+            suffix = compute_unique_suffix(base_amount, discount)
+            recent_pay_amounts[pay_amount] = now
+            return discount, suffix, pay_amount
+
+    # คำนวณ max_discount_thb ตามโหมด
+    max_discount_thb = 0.0
+    if discount_mode == "auto":
+        max_discount_thb = round(base_amount * 0.02, 2)  # 0–2%
+    elif discount_mode.endswith("percen"):
+        num_part = discount_mode[:-6]
+        try:
+            v = float(num_part)
+            max_percent = max(0.0, v * 100.0)  # 0.05 -> 5%
+        except ValueError:
+            max_percent = 2.0
+        max_discount_thb = round(base_amount * (max_percent / 100.0), 2)
+    elif discount_mode.endswith("bath"):
+        num_part = discount_mode[:-4]
+        try:
+            max_discount_thb = max(0.0, round(float(num_part), 2))
+        except ValueError:
+            max_discount_thb = round(base_amount * 0.02, 2)
+    else:
+        max_discount_thb = round(base_amount * 0.02, 2)
+
+    # จำกัดให้ยอดสุดท้ายไม่ต่ำกว่า 1 บาท
+    max_allowed_discount = round(base_amount - 1.0, 2)
+    if max_allowed_discount < 0:
+        max_allowed_discount = 0.0
+    if max_discount_thb > max_allowed_discount:
+        max_discount_thb = max_allowed_discount
+
+    # กรณีไม่มีส่วนลดได้เลย (เช่น amount ใกล้ 1 บาทมาก)
+    if max_discount_thb <= 0:
+        discount = 0.0
         pay_amount = base_amount
+        suffix = 0
         recent_pay_amounts[pay_amount] = now
-        return 0.0, 0, pay_amount
+        if user_id is not None:
+            key = (user_id, base_amount)
+            user_recent_discounts[key] = {
+                "discount": discount,
+                "pay_amount": pay_amount,
+                "mode": discount_mode,
+                "used_at": now,
+            }
+        return discount, suffix, pay_amount
 
-    max_suffix_by_percent = int(base_amount)
-    max_suffix = min(99, max_suffix_by_percent)
-
-    candidate_suffixes = list(range(0, max_suffix + 1))
-    random.shuffle(candidate_suffixes)
-
-    chosen_discount = None
-    chosen_suffix = None
-    chosen_pay_amount = None
-
-    for suffix in candidate_suffixes:
-        discount = round(suffix / 100.0, 2)
-        pay_amount = round(base_amount - discount, 2)
-        if pay_amount <= 0:
+    # สุ่ม discount ให้ pay_amount ไม่เบิ้ลกับอันที่ใช้ล่าสุด (เท่าที่ทำได้)
+    discount = 0.0
+    pay_amount = base_amount
+    for _ in range(20):
+        discount_candidate = round(random.uniform(0, max_discount_thb), 2)
+        pay_candidate = round(base_amount - discount_candidate, 2)
+        if pay_candidate < 1.0:
             continue
-
-        if pay_amount not in recent_pay_amounts:
-            chosen_discount = discount
-            chosen_suffix = suffix
-            chosen_pay_amount = pay_amount
+        if pay_candidate not in recent_pay_amounts:
+            discount = discount_candidate
+            pay_amount = pay_candidate
             break
+    else:
+        # ถ้าลองหลายรอบแล้วยังชนทั้งหมด ก็ไม่ลด
+        discount = 0.0
+        pay_amount = base_amount
 
-    if chosen_discount is None:
-        chosen_discount = 0.0
-        chosen_suffix = 0
-        chosen_pay_amount = base_amount
+    suffix = compute_unique_suffix(base_amount, discount)
+    recent_pay_amounts[pay_amount] = now
 
-    recent_pay_amounts[chosen_pay_amount] = now
+    # cache ให้ user_id
+    if user_id is not None:
+        key = (user_id, base_amount)
+        user_recent_discounts[key] = {
+            "discount": discount,
+            "pay_amount": pay_amount,
+            "mode": discount_mode,
+            "used_at": now,
+        }
 
-    max_discount = round(base_amount * 0.01, 2)
-    if chosen_discount > max_discount:
-        chosen_discount = max_discount
-        chosen_pay_amount = round(base_amount - chosen_discount, 2)
+    return discount, suffix, pay_amount
 
-    return chosen_discount, chosen_suffix, chosen_pay_amount
+
+# ------------------------------------------------------------------------------
+# HELPER: DISCOUNT CALCULATION (none mode queue)
+# ------------------------------------------------------------------------------
+
+def compute_none_mode_discount(
+    base_amount: float,
+    prompay_id: str,
+) -> Tuple[float, int, float]:
+    """
+    none-mode:
+    - ถ้าไม่มีคิวที่ base_amount + prompay_id เดียวกันภายใน 5 นาที -> discount = 0.00
+    - ถ้ามีคิว PENDING (none-mode) อยู่แล้ว n รายการ (ยังไม่เกิน 5 นาที)
+      ใบใหม่จะได้ discount = 0.01 * n (บาท) เช่น 0.01, 0.02, 0.03, ...
+    - ใบที่เกิน 5 นาที จะโดน expire_old_none_mode_payments() CANCELLED ออกไปก่อนแล้ว
+    - ยอดสุดท้ายต้อง >= 1 บาท
+    """
+    now = datetime.utcnow()
+    base_amount = round(base_amount, 2)
+
+    # คิวที่กำลังรออยู่ (none-mode เท่านั้น) และยังไม่เกิน 5 นาที
+    pending_same = [
+        p for p in payments_db.values()
+        if p["status"] == "PENDING"
+        and p.get("discount_mode") == "none"
+        and round(p["base_amount"], 2) == base_amount
+        and p["prompay_id"] == prompay_id
+        and now - p["created_at"] < NONE_MODE_QUEUE_WINDOW
+    ]
+
+    # ลำดับคิว (0 = คนแรก discount 0.00, 1 = 0.01, 2 = 0.02, ...)
+    n = len(pending_same)
+    discount = round(0.01 * n, 2)
+
+    # จำกัดไม่ให้ส่วนลดทำให้ยอดต่ำกว่า 1 บาท
+    max_allowed_discount = round(base_amount - 1.0, 2)
+    if max_allowed_discount < 0:
+        max_allowed_discount = 0.0
+    if discount > max_allowed_discount:
+        discount = max_allowed_discount
+
+    pay_amount = round(base_amount - discount, 2)
+    if pay_amount < 1.0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Calculated pay_amount < 1 in none mode. Please check base amount."
+        )
+
+    suffix = compute_unique_suffix(base_amount, discount)
+    # ไม่จำเป็นต้อง unique global, แต่เก็บไว้ monitor ได้
+    recent_pay_amounts[pay_amount] = now
+
+    return discount, suffix, pay_amount
 
 
 # ------------------------------------------------------------------------------
@@ -454,7 +643,30 @@ async def create_notification(
 
 
 # ------------------------------------------------------------------------------
-# PAYMENT ENDPOINTS (ของเดิม)
+# HELPER: expire old NONE-mode payments
+# ------------------------------------------------------------------------------
+
+async def expire_old_none_mode_payments():
+    """
+    สำหรับ discount_mode = 'none' ถ้ารอเกิน 5 นาทีแล้วยังไม่จ่าย ให้หลุดอัตโนมัติ (CANCELLED)
+    """
+    if not payments_db:
+        return
+    now = datetime.utcnow()
+    for payment in list(payments_db.values()):
+        if (
+            payment["status"] == "PENDING"
+            and payment.get("discount_mode") == "none"
+            and now - payment["created_at"] > NONE_MODE_QUEUE_WINDOW
+        ):
+            payment["status"] = "CANCELLED"
+            payments_db[payment["payment_id"]] = payment
+            print(f"[EXPIRE] payment_id={payment['payment_id']} expired (none mode > 5 min)")
+            await notify_payment(payment, event="EXPIRED")
+
+
+# ------------------------------------------------------------------------------
+# PAYMENT ENDPOINTS
 # ------------------------------------------------------------------------------
 
 @app.post("/payments/qr", response_model=PaymentStatusResponse)
@@ -462,12 +674,37 @@ async def create_payment_qr(body: PaymentCreateRequest):
     prompay_id = body.prompay_id or DEFAULT_PROMPTPAY_ID
 
     base_amount = round(body.amount, 2)
-    discount, suffix, pay_amount = pick_discount_for_base_amount(base_amount)
-
-    if pay_amount <= 0:
+    if base_amount < 1.0:
+        # ตาม requirement: ยอดเงินรวมที่ต้องจ่ายสุดท้าย ต้องมากกว่าหรือเท่า 1 บาท
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Calculated pay_amount <= 0. Please check base amount."
+            detail="Base amount must be at least 1 THB because final pay_amount must be >= 1 THB."
+        )
+
+    # เคลียร์ / expire queue ของ none-mode ก่อน (ใบเก่าเกิน 5 นาทีจะโดน CANCELLED)
+    await expire_old_none_mode_payments()
+
+    discount_mode = resolve_discount_mode(body.discount)
+
+    if discount_mode == "none":
+        # ใช้คิวแบบ incremental: 0.00, 0.01, 0.02, ...
+        discount, suffix, pay_amount = compute_none_mode_discount(
+            base_amount=base_amount,
+            prompay_id=prompay_id,
+        )
+    else:
+        # โหมดอื่นใช้ random ตาม config + ป้องกันกดลุ้นซ้ำด้วย user_id
+        discount, suffix, pay_amount = pick_discount_for_base_amount(
+            base_amount=base_amount,
+            discount_mode=discount_mode,
+            user_id=body.user_id,
+        )
+
+    if pay_amount < 1.0:
+        # safety double-check
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Calculated pay_amount < 1. Please check base amount and discount settings."
         )
 
     payload = generate_promptpay_payload(prompay_id, pay_amount)
@@ -488,6 +725,8 @@ async def create_payment_qr(body: PaymentCreateRequest):
         "status": "PENDING",
         "created_at": now,
         "qr_base64": qr_b64,
+        "user_id": body.user_id,
+        "discount_mode": discount_mode,
     }
 
     payments_db[payment_id] = payment_data
