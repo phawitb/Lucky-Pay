@@ -869,3 +869,20 @@ async def websocket_prompay(prompay_id: str, ws: WebSocket):
                 })
     except WebSocketDisconnect:
         manager_prompay.disconnect(ws)
+
+@app.get("/payments_short/{payment_id}")
+def get_payment_status_short(payment_id: UUID):
+    """
+    Return only the status of payment_id.
+    {
+        "status": "PENDING"
+    }
+    """
+    payment = payments_db.get(payment_id)
+    if not payment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found"
+        )
+
+    return {"status": payment["status"]}
